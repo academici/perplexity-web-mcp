@@ -2,7 +2,7 @@
 import { FastMCP } from "fastmcp";
 import { z } from "zod";
 import { ensureAuthenticated, checkSession } from "./auth.js";
-import { ensureBrowser, getFirstPage } from "./browser.js";
+import { ensureBrowser, getFirstPage, scheduleIdleClose } from "./browser.js";
 import { search, searchWithSources, searchDeep, SearchResult, DEFAULT_TIMEOUT_MS, DEEP_RESEARCH_TIMEOUT_MS } from "./search.js";
 
 function formatResult(result: SearchResult): string {
@@ -11,6 +11,24 @@ function formatResult(result: SearchResult): string {
     ? "\n\nSources:\n" + result.sources.map((s, i) => `${i + 1}. [${s.title}](${s.url})`).join("\n")
     : "";
   return result.answer + sourcesText;
+}
+
+// All tools share one browser window — concurrent tool calls used to race on
+// pages and on browser teardown ("Target page, context or browser has been
+// closed"). Serialize them through a promise queue instead.
+let queue: Promise<unknown> = Promise.resolve();
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const run = async () => {
+    await ensureBrowser();
+    try {
+      return await fn();
+    } finally {
+      scheduleIdleClose();
+    }
+  };
+  const next = queue.then(run, run);
+  queue = next.catch(() => {});
+  return next;
 }
 
 // --- CLI args ---
@@ -22,7 +40,7 @@ const TIMEOUT_MS = timeoutArg ? parseInt(timeoutArg.split("=")[1], 10) * 1000 : 
 // --- MCP server ---
 const mcp = new FastMCP({
   name: "perplexity-web",
-  version: "1.1.1",
+  version: "1.2.0",
 });
 
 mcp.addTool({
@@ -32,11 +50,8 @@ mcp.addTool({
   parameters: z.object({
     query: z.string().describe("The search query"),
   }),
-  execute: async ({ query }) => {
-    await ensureBrowser();
-    const result = await search(query, TIMEOUT_MS);
-    return formatResult(result);
-  },
+  execute: ({ query }) =>
+    serialized(async () => formatResult(await search(query, TIMEOUT_MS))),
 });
 
 mcp.addTool({
@@ -50,11 +65,8 @@ mcp.addTool({
       .min(1)
       .describe("Sources to search: 'web' (general web), 'academic' (scholarly articles), 'social' (Reddit & forums). Can combine multiple."),
   }),
-  execute: async ({ query, sources }) => {
-    await ensureBrowser();
-    const result = await searchWithSources(query, TIMEOUT_MS, sources);
-    return formatResult(result);
-  },
+  execute: ({ query, sources }) =>
+    serialized(async () => formatResult(await searchWithSources(query, TIMEOUT_MS, sources))),
 });
 
 mcp.addTool({
@@ -64,11 +76,8 @@ mcp.addTool({
   parameters: z.object({
     query: z.string().describe("The research query"),
   }),
-  execute: async ({ query }) => {
-    await ensureBrowser();
-    const result = await searchDeep(query, DEEP_RESEARCH_TIMEOUT_MS);
-    return formatResult(result);
-  },
+  execute: ({ query }) =>
+    serialized(async () => formatResult(await searchDeep(query, DEEP_RESEARCH_TIMEOUT_MS))),
 });
 
 mcp.addTool({
@@ -76,16 +85,16 @@ mcp.addTool({
   description:
     "Check if you are authenticated on Perplexity.ai. If not, opens a browser window so you can log in.",
   parameters: z.object({}),
-  execute: async () => {
-    await ensureBrowser();
-    const page = await getFirstPage();
-    const authenticated = await checkSession(page);
-    if (authenticated) {
-      return "Already authenticated on Perplexity.ai.";
-    }
-    await ensureAuthenticated();
-    return "Login successful. You are now authenticated on Perplexity.ai.";
-  },
+  execute: () =>
+    serialized(async () => {
+      const page = await getFirstPage();
+      const authenticated = await checkSession(page);
+      if (authenticated) {
+        return "Already authenticated on Perplexity.ai.";
+      }
+      await ensureAuthenticated();
+      return "Login successful. You are now authenticated on Perplexity.ai.";
+    }),
 });
 
 // --- Startup ---

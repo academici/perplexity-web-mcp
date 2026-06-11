@@ -1,10 +1,17 @@
 import type { Page } from "playwright";
 import { readFile } from "fs/promises";
-import { newSearchPage, closeBrowser } from "./browser.js";
+import { newSearchPage } from "./browser.js";
 
 const PERPLEXITY_HOME = "https://www.perplexity.ai/";
-export const DEFAULT_TIMEOUT_MS = 20_000;
-export const DEEP_RESEARCH_TIMEOUT_MS = 300_000; // 5 minutes
+export const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEEP_RESEARCH_TIMEOUT_MS = 600_000; // 10 minutes
+
+// Streaming is considered finished when the stop button is gone AND the answer
+// text hasn't changed for this long...
+const STREAM_STABLE_MS = 2_500;
+// ...then we wait a little more before parsing/exporting, so late DOM updates
+// (citations, footers, export button) are in place.
+const SETTLE_BEFORE_PARSE_MS = 1_500;
 
 // Maps source name to its SVG icon id in the Perplexity UI — locale-independent
 const SOURCE_ICON: Record<string, string> = {
@@ -97,33 +104,68 @@ async function runSearch(query: string, timeoutMs: number, sources: string[] | n
     log(`Done. Answer length: ${answer.length} chars, sources: ${citedSources.length}`);
     return { answer, sources: citedSources };
   } finally {
-    await page.close();
-    await closeBrowser();
+    // Close only this tab. The browser context stays alive between calls
+    // (closing it here killed requests still streaming in parallel tabs);
+    // an idle timer in browser.ts releases the profile when unused.
+    await page.close().catch(() => {});
   }
 }
 
-async function waitForAnswerComplete(page: Page, timeoutMs: number): Promise<void> {
-  // Wait for the "N sources" button — signals answer has started
-  await page.locator("button").filter({ hasText: /\d/ }).first().waitFor({ timeout: timeoutMs });
+// True while Perplexity is still generating: a stop button is present.
+// Located by icon id (locale-independent) with aria-label fallback.
+function isGenerating(): boolean {
+  const byIcon = Array.from(document.querySelectorAll("button")).some((b) => {
+    const use = b.querySelector("use");
+    const href = use?.getAttribute("xlink:href") ?? use?.getAttribute("href") ?? "";
+    return href === "#pplx-icon-stop" || href === "#pplx-icon-stop-circle";
+  });
+  if (byIcon) return true;
+  return Array.from(document.querySelectorAll("button")).some((b) => {
+    const label = (b.getAttribute("aria-label") ?? "").toLowerCase();
+    return label.includes("stop") || label.includes("arrêter") || label.includes("остановить");
+  });
+}
 
-  // Then poll until the tabpanel content stops changing for 1.5s (streaming finished)
-  const deadline = Date.now() + Math.min(timeoutMs, 60_000);
+async function waitForAnswerComplete(page: Page, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  // 1. Wait until the answer has started: answer panel got text, generation
+  //    indicator appeared, or (legacy fallback) the "N sources" button showed up.
+  await page.waitForFunction(
+    `(${isGenerating.toString()})()
+      || ((document.querySelector('[role="tabpanel"]')?.textContent ?? '').trim().length > 0)
+      || Array.from(document.querySelectorAll('button')).some(b => /\\d/.test(b.textContent ?? ''))`,
+    undefined,
+    { timeout: timeoutMs },
+  );
+
+  // 2. Poll until generation finished: no stop button AND content stable.
+  //    Uses the full deadline — deep research streams for many minutes, and a
+  //    short cap here used to truncate answers mid-stream.
   let lastContent = "";
   let stableMs = 0;
 
   while (Date.now() < deadline) {
-    const content = await page.evaluate(() =>
-      document.querySelector('[role="tabpanel"]')?.textContent ?? ""
-    );
-    if (content === lastContent) {
+    const { generating, content } = await page.evaluate(
+      `(() => ({
+        generating: (${isGenerating.toString()})(),
+        content: document.querySelector('[role="tabpanel"]')?.textContent ?? document.body.textContent ?? "",
+      }))()`,
+    ) as { generating: boolean; content: string };
+
+    if (!generating && content === lastContent) {
       stableMs += 500;
-      if (stableMs >= 1_500) break;
+      if (stableMs >= STREAM_STABLE_MS) break;
     } else {
       lastContent = content;
       stableMs = 0;
     }
     await page.waitForTimeout(500);
   }
+
+  // 3. Grace period before parsing/export — let the final DOM mutations
+  //    (citations, export controls) land.
+  await page.waitForTimeout(SETTLE_BEFORE_PARSE_MS);
 }
 
 async function exportAsMarkdown(page: Page): Promise<string | null> {
