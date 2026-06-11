@@ -1,8 +1,10 @@
 import type { Page } from "playwright";
-import { newSearchPage } from "./browser.js";
+import { readFile } from "fs/promises";
+import { newSearchPage, closeBrowser } from "./browser.js";
 
 const PERPLEXITY_HOME = "https://www.perplexity.ai/";
 export const DEFAULT_TIMEOUT_MS = 20_000;
+export const DEEP_RESEARCH_TIMEOUT_MS = 300_000; // 5 minutes
 
 // Maps source name to its SVG icon id in the Perplexity UI — locale-independent
 const SOURCE_ICON: Record<string, string> = {
@@ -25,15 +27,20 @@ const log = (msg: string) => console.error(`[perplexity-web-mcp] ${msg}`);
 
 export async function search(query: string, timeoutMs: number): Promise<SearchResult> {
   log(`Search: "${query}" (timeout: ${timeoutMs}ms)`);
-  return runSearch(query, timeoutMs, null);
+  return runSearch(query, timeoutMs, null, false);
 }
 
 export async function searchWithSources(query: string, timeoutMs: number, sources: string[]): Promise<SearchResult> {
   log(`Search: "${query}" sources=[${sources.join(",")}] (timeout: ${timeoutMs}ms)`);
-  return runSearch(query, timeoutMs, sources);
+  return runSearch(query, timeoutMs, sources, false);
 }
 
-async function runSearch(query: string, timeoutMs: number, sources: string[] | null): Promise<SearchResult> {
+export async function searchDeep(query: string, timeoutMs: number): Promise<SearchResult> {
+  log(`Deep Research: "${query}" (timeout: ${timeoutMs}ms)`);
+  return runSearch(query, timeoutMs, null, true);
+}
+
+async function runSearch(query: string, timeoutMs: number, sources: string[] | null, deepResearch: boolean): Promise<SearchResult> {
   const page = await newSearchPage();
 
   try {
@@ -44,7 +51,9 @@ async function runSearch(query: string, timeoutMs: number, sources: string[] | n
     // Wait for the search input to be ready before any further interaction
     await page.locator("#ask-input").first().waitFor({ state: "visible", timeout: 10_000 });
 
-    if (sources) {
+    if (deepResearch) {
+      await enableDeepResearch(page);
+    } else if (sources) {
       log(`Selecting sources: [${sources.join(", ")}]...`);
       await selectSources(page, sources);
     }
@@ -64,23 +73,136 @@ async function runSearch(query: string, timeoutMs: number, sources: string[] | n
     await searchBox.press("Enter");
 
     log("Waiting for answer to complete...");
-    // Perplexity shows a "N sources" button when the answer finishes.
-    // The word varies by UI language — match any button whose text contains digits.
-    await page.locator("button").filter({ hasText: /\d/ }).first().waitFor({ timeout: timeoutMs });
+    await waitForAnswerComplete(page, timeoutMs);
 
     await dismissDialogs(page);
 
-    log("Extracting answer from DOM...");
-    const [answer, citedSources] = await Promise.all([
-      extractAnswer(page),
-      extractSources(page),
-    ]);
+    log("Extracting result...");
+    const mdContent = await exportAsMarkdown(page);
+    let answer: string;
+    let citedSources: Source[];
+
+    if (mdContent) {
+      log(`MD export succeeded (${mdContent.length} chars)`);
+      answer = mdContent;
+      citedSources = [];
+    } else {
+      log("MD export failed — falling back to DOM extraction");
+      [answer, citedSources] = await Promise.all([
+        extractAnswer(page),
+        extractSources(page),
+      ]);
+    }
 
     log(`Done. Answer length: ${answer.length} chars, sources: ${citedSources.length}`);
     return { answer, sources: citedSources };
   } finally {
     await page.close();
+    await closeBrowser();
   }
+}
+
+async function waitForAnswerComplete(page: Page, timeoutMs: number): Promise<void> {
+  // Wait for the "N sources" button — signals answer has started
+  await page.locator("button").filter({ hasText: /\d/ }).first().waitFor({ timeout: timeoutMs });
+
+  // Then poll until the tabpanel content stops changing for 1.5s (streaming finished)
+  const deadline = Date.now() + Math.min(timeoutMs, 60_000);
+  let lastContent = "";
+  let stableMs = 0;
+
+  while (Date.now() < deadline) {
+    const content = await page.evaluate(() =>
+      document.querySelector('[role="tabpanel"]')?.textContent ?? ""
+    );
+    if (content === lastContent) {
+      stableMs += 500;
+      if (stableMs >= 1_500) break;
+    } else {
+      lastContent = content;
+      stableMs = 0;
+    }
+    await page.waitForTimeout(500);
+  }
+}
+
+async function exportAsMarkdown(page: Page): Promise<string | null> {
+  try {
+    // .catch prevents unhandled rejection if page closes before download triggers
+    const downloadPromise = page.waitForEvent("download", { timeout: 8_000 }).catch(() => null);
+
+    // Click the download button (#pplx-icon-download / "Скачать")
+    const iconClicked = await page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll("button, [role='button']")).find((b) => {
+        const use = b.querySelector("use");
+        return use && (use.getAttribute("xlink:href") === "#pplx-icon-download" || use.getAttribute("href") === "#pplx-icon-download");
+      });
+      if (btn) { (btn as HTMLElement).click(); return true; }
+      return false;
+    });
+
+    if (!iconClicked) return null;
+
+    // Submenu may appear — look for Markdown option
+    await page.waitForTimeout(400);
+    const mdItem = page.locator(
+      '[role="menuitem"]:has-text("Markdown"), [role="option"]:has-text("Markdown"), [role="menuitem"]:has-text("markdown" )'
+    ).first();
+    if (await mdItem.isVisible({ timeout: 1_500 }).catch(() => false)) {
+      await mdItem.click();
+    }
+
+    const download = await downloadPromise;
+    if (!download) return null;
+    const filePath = await download.path();
+    if (!filePath) return null;
+
+    return readFile(filePath, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+async function enableDeepResearch(page: Page): Promise<void> {
+  log("Enabling deep research mode...");
+
+  // Strategy 1: SVG icon ID — same locale-independent pattern used by selectSources
+  const iconClicked = await page.evaluate(() => {
+    const candidates = ["#pplx-icon-deep-research", "#pplx-icon-microscope", "#pplx-icon-research"];
+    for (const id of candidates) {
+      const btn = Array.from(document.querySelectorAll("button")).find((b) => {
+        const use = b.querySelector("use");
+        return use && (use.getAttribute("xlink:href") === id || use.getAttribute("href") === id);
+      });
+      if (btn) { (btn as HTMLElement).click(); return id; }
+    }
+    return null;
+  });
+
+  if (iconClicked) {
+    log(`Deep research activated via icon ${iconClicked}`);
+    await page.waitForTimeout(500);
+    return;
+  }
+
+  // Strategy 2: visible button by text or aria-label
+  const textSelectors = [
+    'button:has-text("Deep Research")',
+    'button:has-text("Recherche approfondie")',
+    'button[aria-label*="Deep Research"]',
+    'button[aria-label*="deep research" i]',
+  ];
+  for (const sel of textSelectors) {
+    const btn = page.locator(sel).first();
+    if (await btn.isVisible({ timeout: 1_000 }).catch(() => false)) {
+      await btn.click();
+      log(`Deep research activated via: ${sel}`);
+      await page.waitForTimeout(500);
+      return;
+    }
+  }
+
+  log("Warning: deep research toggle not found — proceeding with default mode.");
 }
 
 // Selects the given sources in the Perplexity "Connecteurs et sources" submenu.

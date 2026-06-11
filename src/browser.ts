@@ -2,11 +2,14 @@ import { chromium, type BrowserContext, type Page } from "playwright";
 import path from "path";
 import { fileURLToPath } from "url";
 import { execSync } from "child_process";
+import { existsSync, rmSync } from "fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROFILE_DIR = path.resolve(__dirname, "../.playwright/profile");
 
 function checkChromiumInstalled(): void {
+  // If a custom executable is provided via env, skip the Playwright binary check
+  if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) return;
   try {
     execSync("npx playwright install --dry-run chromium", { stdio: "ignore" });
   } catch {
@@ -17,7 +20,8 @@ function checkChromiumInstalled(): void {
   } catch {
     console.error(
       "[perplexity-web-mcp] Chromium is not installed.\n" +
-      "Run: npx playwright install chromium"
+      "Run: npx playwright install chromium\n" +
+      "Or set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/path/to/chromium"
     );
     process.exit(1);
   }
@@ -32,20 +36,38 @@ export async function launchBrowser(): Promise<void> {
     context = null;
   }
 
+  // Remove stale lock left by a crashed previous instance
+  const lockFile = path.join(PROFILE_DIR, "SingletonLock");
+  if (existsSync(lockFile)) {
+    try { rmSync(lockFile); } catch {}
+  }
+
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
   context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: false,
+    ...(executablePath ? { executablePath } : {}),
+    acceptDownloads: true,
     viewport: { width: 1280, height: 800 },
     args: [
       "--no-sandbox",
       "--disable-blink-features=AutomationControlled",
-      "--window-position=0,0",
+      "--ozone-platform=x11",
+      "--disable-gpu",
+      "--window-position=-5000,-5000",
       "--no-focus-on-map",
     ],
   });
 }
 
 export async function ensureBrowser(): Promise<void> {
-  if (!context) await launchBrowser();
+  if (!context) { await launchBrowser(); return; }
+  // Re-launch if context was closed externally
+  try {
+    context.pages();
+  } catch {
+    context = null;
+    await launchBrowser();
+  }
 }
 
 export function getContext(): BrowserContext {

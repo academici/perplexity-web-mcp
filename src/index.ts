@@ -3,7 +3,7 @@ import { FastMCP } from "fastmcp";
 import { z } from "zod";
 import { ensureAuthenticated, checkSession } from "./auth.js";
 import { ensureBrowser, getFirstPage } from "./browser.js";
-import { search, searchWithSources, SearchResult, DEFAULT_TIMEOUT_MS } from "./search.js";
+import { search, searchWithSources, searchDeep, SearchResult, DEFAULT_TIMEOUT_MS, DEEP_RESEARCH_TIMEOUT_MS } from "./search.js";
 
 function formatResult(result: SearchResult): string {
   if (!result.answer) return "No answer found. Perplexity may have changed its structure.";
@@ -53,6 +53,20 @@ mcp.addTool({
   execute: async ({ query, sources }) => {
     await ensureBrowser();
     const result = await searchWithSources(query, TIMEOUT_MS, sources);
+    return formatResult(result);
+  },
+});
+
+mcp.addTool({
+  name: "search_deep",
+  description:
+    "Run a Deep Research query on Perplexity.ai — multi-step iterative search that synthesizes 20+ sources. Much slower than `search` (up to 5 minutes). Use only when breadth and depth matter: market analysis, competitive landscape, academic overviews.",
+  parameters: z.object({
+    query: z.string().describe("The research query"),
+  }),
+  execute: async ({ query }) => {
+    await ensureBrowser();
+    const result = await searchDeep(query, DEEP_RESEARCH_TIMEOUT_MS);
     return formatResult(result);
   },
 });

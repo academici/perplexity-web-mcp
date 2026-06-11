@@ -26,11 +26,11 @@
     "search",
     "playwright"
   ],
-  "author": "quequiere",
+  "author": "academici",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/quequiere/perplexity-web-mcp"
+    "url": "https://github.com/academici/perplexity-web-mcp"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -41,7 +41,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/node": "^25.3.5",
+    "@types/node": "^25.9.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }
