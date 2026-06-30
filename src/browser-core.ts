@@ -76,6 +76,14 @@ export async function launchContext(profileDir: string): Promise<BrowserContext>
       "--disable-gpu",
       "--window-position=-5000,-5000",
       "--no-focus-on-map",
+      // Keep every search tab running at full speed even when it is not the
+      // foreground/visible one. With maxConcurrency>1 only a single tab can be
+      // foreground at a time; Chromium would otherwise throttle the others'
+      // timers and may freeze their rendering, slowing or stalling the
+      // streaming-completion detection in waitForAnswerComplete().
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-backgrounding-occluded-windows",
     ],
   });
   context.on("close", () => { context = null; });
