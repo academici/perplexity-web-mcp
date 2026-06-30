@@ -4,3 +4,10 @@ dist/
 network-analysis.md
 *.log
 .env
+
+# academici ecosystem (machine-specific обвязка mAInd/swissknifeman — НЕ публиковать)
+.claude/
+.mcp.json
+.serena/
+CLAUDE.md
+*.bak
