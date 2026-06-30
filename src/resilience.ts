@@ -73,6 +73,9 @@ function writeErrorLog(rec: FailureRecord, ctx: ResilienceContext): void {
 // or have no display — any of that just no-ops, never breaks the tool call.
 function notifyDesktop(rec: FailureRecord, ctx: ResilienceContext): void {
   if (!ctx.cfg.notify.enabled) return;
+  // LOGIN_REQUIRED already triggered the daemon's single, immediate "please log
+  // in" alert; re-notifying here would spam one per concurrent agent.
+  if (rec.code === "LOGIN_REQUIRED") return;
   const title = `Perplexity ✖ ${rec.project}`;
   const body = `${rec.tool} failed (${rec.code}) after ${rec.attempts} attempt(s): ${truncate(rec.message, 140)}`;
   try {

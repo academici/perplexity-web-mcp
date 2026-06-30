@@ -22,6 +22,12 @@ export interface PoolCfg {
   saturation?: Partial<SaturationCfg>;
   searchTimeoutMs?: number;
   deepTimeoutMs?: number;
+  // When a search hits an unauthenticated session, the daemon opens a single
+  // login grace window: it notifies the user and polls for login for authWaitMs.
+  // While the window is open (and during the cooldown after it expires without a
+  // login) searches fail fast with LOGIN_REQUIRED rather than hang or churn tabs.
+  authWaitMs?: number;
+  authCooldownMs?: number;
 }
 
 // Client-side resilience knobs: retry-with-backoff, structured error logging,
@@ -69,6 +75,8 @@ export interface PoolKnobs {
   saturation: SaturationCfg;
   searchTimeoutMs: number;
   deepTimeoutMs: number;
+  authWaitMs: number;
+  authCooldownMs: number;
 }
 
 export const DEFAULT_POOL_KNOBS: Omit<PoolKnobs, "socketPath" | "profileDir"> = {
@@ -77,6 +85,10 @@ export const DEFAULT_POOL_KNOBS: Omit<PoolKnobs, "socketPath" | "profileDir"> = 
   saturation: { mode: "hybrid", waitMs: 30_000 },
   searchTimeoutMs: 60_000,
   deepTimeoutMs: 600_000,
+  // 3-minute login grace window, then a 3-minute skip-cooldown before the next
+  // search may reopen it. Long enough for an interactive (incl. OAuth) re-login.
+  authWaitMs: 180_000,
+  authCooldownMs: 180_000,
 };
 
 export const DEFAULT_RESILIENCE: ResilienceCfg = {
@@ -185,6 +197,8 @@ export function getPoolKnobs(config: Config, name: string): PoolKnobs {
     },
     searchTimeoutMs: p.searchTimeoutMs ?? DEFAULT_POOL_KNOBS.searchTimeoutMs,
     deepTimeoutMs: p.deepTimeoutMs ?? DEFAULT_POOL_KNOBS.deepTimeoutMs,
+    authWaitMs: p.authWaitMs ?? DEFAULT_POOL_KNOBS.authWaitMs,
+    authCooldownMs: p.authCooldownMs ?? DEFAULT_POOL_KNOBS.authCooldownMs,
   };
 }
 
