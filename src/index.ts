@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import path from "path";
 import { fileURLToPath } from "url";
-import { parseFlags, loadConfig, resolveMode, resolvePoolName } from "./config.js";
+import { parseFlags, loadConfig, resolveMode, resolvePoolName, getResilience } from "./config.js";
 import { resolvePool, type ResolvedPool } from "./pool.js";
 import { DispatcherError, type Dispatcher } from "./dispatcher.js";
+import { withResilience } from "./resilience.js";
 import type { SearchResult } from "./search.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -95,7 +96,7 @@ async function startMcp(dispatcher: Dispatcher): Promise<void> {
     }
   }
 
-  const mcp = new FastMCP({ name: "perplexity-web", version: "1.3.0" });
+  const mcp = new FastMCP({ name: "perplexity-web", version: "1.4.0" });
 
   mcp.addTool({
     name: "search",
@@ -143,7 +144,16 @@ async function runAsClient(): Promise<void> {
   const mode = resolveMode(flags, env, config);
   console.error(`[perplexity-web-mcp] Starting (mode=${mode}, pool=${pool.name}). Browser launches on first tool call.`);
   const dispatcher = await buildDispatcher(pool);
-  await startMcp(dispatcher);
+  // Wrap with client-side resilience (retry + structured error log + desktop
+  // notify). The consuming project is identified by this process's cwd.
+  const cwd = process.cwd();
+  const resilient = withResilience(dispatcher, {
+    cfg: getResilience(config, env),
+    pool: pool.name,
+    project: { name: path.basename(cwd), path: cwd },
+    env,
+  });
+  await startMcp(resilient);
 }
 
 async function main(): Promise<void> {
