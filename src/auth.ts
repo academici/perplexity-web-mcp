@@ -1,12 +1,10 @@
 import type { Page } from "playwright";
-import { ensureBrowser, getFirstPage } from "./browser.js";
+import { log } from "./logger.js";
 
 const PERPLEXITY_HOME = "https://www.perplexity.ai/";
 const AUTH_CHECK_URL = "https://www.perplexity.ai/api/auth/session?version=2.18&source=default";
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-
-const log = (msg: string) => console.error(`[perplexity-web-mcp] ${msg}`);
 
 interface Session {
   user?: { id: string; email?: string };
@@ -26,9 +24,10 @@ export async function checkSession(page: Page): Promise<boolean> {
   }
 }
 
-export async function ensureAuthenticated(): Promise<void> {
-  await ensureBrowser();
-  const page = await getFirstPage();
+// Drive the login flow on a caller-supplied page. The daemon passes its shared
+// visible first tab; the legacy wrapper below acquires it from the singleton
+// context. Never creates the browser itself.
+export async function ensureAuthenticatedOnPage(page: Page): Promise<void> {
   await page.goto(PERPLEXITY_HOME, { waitUntil: "domcontentloaded" });
 
   const authenticated = await checkSession(page);

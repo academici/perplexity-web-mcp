@@ -1,6 +1,6 @@
 import type { Page } from "playwright";
 import { readFile } from "fs/promises";
-import { newSearchPage } from "./browser.js";
+import { log } from "./logger.js";
 
 const PERPLEXITY_HOME = "https://www.perplexity.ai/";
 export const DEFAULT_TIMEOUT_MS = 60_000;
@@ -30,27 +30,24 @@ export interface SearchResult {
   sources: Source[];
 }
 
-const log = (msg: string) => console.error(`[perplexity-web-mcp] ${msg}`);
-
-export async function search(query: string, timeoutMs: number): Promise<SearchResult> {
-  log(`Search: "${query}" (timeout: ${timeoutMs}ms)`);
-  return runSearch(query, timeoutMs, null, false);
+export interface RunSearchOpts {
+  sources?: string[] | null;
+  deepResearch?: boolean;
 }
 
-export async function searchWithSources(query: string, timeoutMs: number, sources: string[]): Promise<SearchResult> {
-  log(`Search: "${query}" sources=[${sources.join(",")}] (timeout: ${timeoutMs}ms)`);
-  return runSearch(query, timeoutMs, sources, false);
-}
+// Run a full Perplexity search on a caller-supplied page. The caller owns the
+// page lifecycle (the daemon's TabPool, or the legacy wrapper above) — this
+// function never creates or closes the tab, so parallel searches in sibling
+// tabs are never disturbed.
+export async function runSearchOnPage(
+  page: Page,
+  query: string,
+  timeoutMs: number,
+  opts: RunSearchOpts = {},
+): Promise<SearchResult> {
+  const { sources = null, deepResearch = false } = opts;
 
-export async function searchDeep(query: string, timeoutMs: number): Promise<SearchResult> {
-  log(`Deep Research: "${query}" (timeout: ${timeoutMs}ms)`);
-  return runSearch(query, timeoutMs, null, true);
-}
-
-async function runSearch(query: string, timeoutMs: number, sources: string[] | null, deepResearch: boolean): Promise<SearchResult> {
-  const page = await newSearchPage();
-
-  try {
+  {
     log("Navigating to perplexity.ai...");
     await page.goto(PERPLEXITY_HOME, { waitUntil: "domcontentloaded" });
     await dismissDialogs(page);
@@ -103,11 +100,6 @@ async function runSearch(query: string, timeoutMs: number, sources: string[] | n
 
     log(`Done. Answer length: ${answer.length} chars, sources: ${citedSources.length}`);
     return { answer, sources: citedSources };
-  } finally {
-    // Close only this tab. The browser context stays alive between calls
-    // (closing it here killed requests still streaming in parallel tabs);
-    // an idle timer in browser.ts releases the profile when unused.
-    await page.close().catch(() => {});
   }
 }
 
