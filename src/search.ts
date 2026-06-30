@@ -245,15 +245,44 @@ async function selectSources(page: Page, sources: string[]): Promise<void> {
   const targetIcons = sources.map(s => SOURCE_ICON[s]).filter(Boolean);
   if (targetIcons.length === 0) return;
 
-  // Open the "+" menu — located by its icon #pplx-icon-plus
-  const addBtnLabel = await page.evaluate(() => {
+  // Open the "+" ("Add files or tools") menu — located by its icon. Perplexity
+  // has shipped this under more than one icon id over time, so match any known
+  // one. We scope to aria-haspopup="menu" so the unrelated sidebar "+" (new
+  // thread, also #pplx-icon-plus) never matches. The toolbar can hydrate a beat
+  // after #ask-input, so poll instead of failing on the first miss.
+  const handle = await page.waitForFunction(() => {
+    const ADD_ICONS = ["#pplx-icon-custom-plus-large", "#pplx-icon-plus"];
     const btn = Array.from(document.querySelectorAll('button[aria-haspopup="menu"]')).find(b => {
       const use = b.querySelector('use');
-      return use && (use.getAttribute('xlink:href') === '#pplx-icon-plus' || use.getAttribute('href') === '#pplx-icon-plus');
+      const href = use?.getAttribute('xlink:href') ?? use?.getAttribute('href') ?? '';
+      return ADD_ICONS.includes(href);
     });
     return btn?.getAttribute('aria-label') ?? null;
-  });
-  if (!addBtnLabel) throw new Error("Could not find the + (add) button on Perplexity");
+  }, undefined, { timeout: 8_000 }).catch(() => null);
+  const addBtnLabel = handle ? (await handle.jsonValue()) as string | null : null;
+  if (!addBtnLabel) {
+    const diag = await page.evaluate(() => {
+      const uses = new Set<string>();
+      document.querySelectorAll("use").forEach(u => {
+        const h = u.getAttribute("xlink:href") ?? u.getAttribute("href");
+        if (h) uses.add(h);
+      });
+      const haspopup = Array.from(document.querySelectorAll('button[aria-haspopup="menu"]'))
+        .map(b => b.getAttribute("aria-label") ?? b.textContent?.trim().slice(0, 30) ?? "");
+      const signIn = Array.from(document.querySelectorAll("button, a"))
+        .some(el => /sign\s*in|log\s*in|se connecter|войти/i.test(el.textContent ?? ""));
+      return {
+        url: location.href,
+        buttons: document.querySelectorAll("button").length,
+        haspopupMenus: haspopup,
+        pluxIcons: Array.from(uses).filter(h => h.includes("plus") || h.includes("plug")),
+        allIcons: Array.from(uses).slice(0, 60),
+        looksLoggedOut: signIn,
+      };
+    }).catch(() => null);
+    log(`+ button not found. DIAG: ${JSON.stringify(diag)}`);
+    throw new Error("Could not find the + (add) button on Perplexity");
+  }
   await page.locator(`button[aria-label="${addBtnLabel}"]`).click();
   await page.waitForTimeout(300);
 
