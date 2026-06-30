@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "fs";
 import path from "path";
+import type { DispatcherErrorCode } from "./dispatcher.js";
 
 // ---------------------------------------------------------------------------
 // Config schema
@@ -23,10 +24,40 @@ export interface PoolCfg {
   deepTimeoutMs?: number;
 }
 
+// Client-side resilience knobs: retry-with-backoff, structured error logging,
+// and desktop notifications. These live in the CLIENT process (which knows the
+// consuming project's cwd), not the daemon.
+export interface RetryCfg {
+  attempts: number; // total attempts including the first (1 = no retry)
+  baseDelayMs: number; // first backoff delay; doubles each retry up to maxDelayMs
+  maxDelayMs: number;
+  retryableCodes: DispatcherErrorCode[];
+}
+
+export interface NotifyCfg {
+  enabled: boolean; // fire a desktop notification (notify-send) when a call finally fails
+}
+
+export interface ErrorLogCfg {
+  enabled: boolean;
+  path?: string; // empty/undefined => derived under XDG_STATE_HOME/perplexity-web-mcp/errors.jsonl
+}
+
+export interface ResilienceCfg {
+  retry: RetryCfg;
+  notify: NotifyCfg;
+  errorLog: ErrorLogCfg;
+}
+
 export interface Config {
   mode: Mode;
   defaultPool: string;
   pools: Record<string, PoolCfg>;
+  resilience?: {
+    retry?: Partial<RetryCfg>;
+    notify?: Partial<NotifyCfg>;
+    errorLog?: Partial<ErrorLogCfg>;
+  };
 }
 
 // Fully-resolved pool knobs (paths still derived separately in pool.ts).
@@ -46,6 +77,20 @@ export const DEFAULT_POOL_KNOBS: Omit<PoolKnobs, "socketPath" | "profileDir"> = 
   saturation: { mode: "hybrid", waitMs: 30_000 },
   searchTimeoutMs: 60_000,
   deepTimeoutMs: 600_000,
+};
+
+export const DEFAULT_RESILIENCE: ResilienceCfg = {
+  // Retry transient failures only. BROWSER_BUSY is included for safety even
+  // though "queue" saturation makes it rare; LOGIN_REQUIRED / PROTOCOL_MISMATCH
+  // are deliberately NOT retryable (they need human/version action).
+  retry: {
+    attempts: 3,
+    baseDelayMs: 1_000,
+    maxDelayMs: 8_000,
+    retryableCodes: ["BROWSER_BUSY", "TIMEOUT", "INTERNAL"],
+  },
+  notify: { enabled: true },
+  errorLog: { enabled: true },
 };
 
 // ---------------------------------------------------------------------------
@@ -84,7 +129,36 @@ export function mergeConfig(partial: Partial<Config> | null | undefined): Config
     mode: partial?.mode === "legacy" ? "legacy" : "daemon",
     defaultPool: partial?.defaultPool ?? "default",
     pools: partial?.pools ?? {},
+    resilience: partial?.resilience,
   };
+}
+
+// Merge built-in resilience defaults with the config's optional overrides, then
+// apply env kill-switches (PERPLEXITY_WEB_MCP_NOTIFY/RETRIES/ERRORLOG=0|off).
+export function getResilience(config: Config, env: NodeJS.ProcessEnv): ResilienceCfg {
+  const r = config.resilience ?? {};
+  const off = (v: string | undefined) => v === "0" || v === "false" || v === "off";
+  const attempts = r.retry?.attempts ?? DEFAULT_RESILIENCE.retry.attempts;
+  const envAttempts = env.PERPLEXITY_WEB_MCP_RETRIES ? parseInt(env.PERPLEXITY_WEB_MCP_RETRIES, 10) : NaN;
+  return {
+    retry: {
+      attempts: Number.isFinite(envAttempts) && envAttempts >= 1 ? envAttempts : attempts,
+      baseDelayMs: r.retry?.baseDelayMs ?? DEFAULT_RESILIENCE.retry.baseDelayMs,
+      maxDelayMs: r.retry?.maxDelayMs ?? DEFAULT_RESILIENCE.retry.maxDelayMs,
+      retryableCodes: r.retry?.retryableCodes ?? DEFAULT_RESILIENCE.retry.retryableCodes,
+    },
+    notify: { enabled: off(env.PERPLEXITY_WEB_MCP_NOTIFY) ? false : (r.notify?.enabled ?? DEFAULT_RESILIENCE.notify.enabled) },
+    errorLog: {
+      enabled: off(env.PERPLEXITY_WEB_MCP_ERRORLOG) ? false : (r.errorLog?.enabled ?? DEFAULT_RESILIENCE.errorLog.enabled),
+      path: r.errorLog?.path,
+    },
+  };
+}
+
+// Default structured error-log path: XDG_STATE_HOME/perplexity-web-mcp/errors.jsonl.
+export function defaultErrorLogPath(env: NodeJS.ProcessEnv): string {
+  const state = env.XDG_STATE_HOME || (env.HOME ? path.join(env.HOME, ".local", "state") : path.join("/tmp"));
+  return path.join(state, "perplexity-web-mcp", "errors.jsonl");
 }
 
 export function resolveMode(flags: Flags, env: NodeJS.ProcessEnv, config: Config): Mode {
