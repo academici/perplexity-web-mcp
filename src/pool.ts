@@ -13,6 +13,8 @@ export interface ResolvedPool {
   saturation: SaturationCfg;
   searchTimeoutMs: number;
   deepTimeoutMs: number;
+  authWaitMs: number;
+  authCooldownMs: number;
 }
 
 const ENDPOINT_DIR_NAME = "perplexity-web-mcp";
@@ -69,5 +71,7 @@ export function resolvePool(
     saturation: knobs.saturation,
     searchTimeoutMs: knobs.searchTimeoutMs,
     deepTimeoutMs: knobs.deepTimeoutMs,
+    authWaitMs: knobs.authWaitMs,
+    authCooldownMs: knobs.authCooldownMs,
   };
 }

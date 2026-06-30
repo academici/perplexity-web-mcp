@@ -1,5 +1,6 @@
 import net from "net";
 import path from "path";
+import { spawn } from "child_process";
 import { mkdirSync, unlinkSync, appendFileSync } from "fs";
 import type { Page } from "playwright";
 import type { ResolvedPool } from "../pool.js";
@@ -11,6 +12,16 @@ import { DispatcherError } from "../dispatcher.js";
 import { TabPool, type Slot } from "./tabpool.js";
 import { acquireSocket } from "./bind.js";
 import { NdjsonDecoder, encode, PROTOCOL_VERSION, type RpcRequest, type ServerMessage } from "./protocol.js";
+
+const PERPLEXITY_HOME = "https://www.perplexity.ai/";
+// How long a confirmed session is trusted before the next search re-probes it.
+// Keeps the common (logged-in) path from fetching the session on every request.
+const AUTH_OK_TTL_MS = 60_000;
+// Background poll cadence while waiting for the user to log in.
+const AUTH_POLL_MS = 3_000;
+
+const notifyOff = (v?: string) =>
+  v === "0" || v === "false" || v === "off";
 
 // The browser-owning daemon. One per pool: owns the persistent context, runs up
 // to maxConcurrency search tabs in parallel (one per request), applies the
@@ -36,6 +47,107 @@ export async function runDaemon(pool: ResolvedPool): Promise<void> {
   let server: net.Server | null = null;
   let shuttingDown = false;
   const markActivity = () => { lastActivity = Date.now(); };
+
+  // --- auth gate state ---
+  // A single daemon-wide login window coordinates every connected client (the
+  // user may run ~6 background agents at once). We never block a search waiting
+  // for an interactive login — that would exceed the client's request timeout
+  // and churn tabs. Instead: detect logged-out, fire one notification, open one
+  // grace window, and fail incoming searches fast with LOGIN_REQUIRED until the
+  // user logs in (then searches resume) or the window expires (then a cooldown
+  // before the next search may reopen it).
+  let authOkUntil = 0;       // session confirmed; trust it until this time
+  let authWindowUntil = 0;   // a login grace window is open until this time
+  let authBlockedUntil = 0;  // window expired w/o login; skip until this time
+  let authPolling = false;   // background login-poll loop is running
+  let probeInFlight: Promise<boolean> | null = null;
+
+  // Run the session check on the shared visible first tab. Navigates it to
+  // Perplexity only when it isn't already there, so it never interrupts an
+  // in-progress login (incl. an OAuth redirect away from perplexity.ai — there
+  // the fetch simply fails and we report "not authenticated" without touching
+  // the page). Concurrent callers share one in-flight probe.
+  function probeSession(): Promise<boolean> {
+    if (probeInFlight) return probeInFlight;
+    probeInFlight = (async () => {
+      const ctx = getContext();
+      const page = ctx.pages()[0] ?? await ctx.newPage();
+      if (!page.url().startsWith(PERPLEXITY_HOME)) {
+        await page.goto(PERPLEXITY_HOME, { waitUntil: "domcontentloaded" }).catch(() => {});
+      }
+      return checkSession(page);
+    })().finally(() => { probeInFlight = null; });
+    return probeInFlight;
+  }
+
+  function notifyAuthRequired(): void {
+    if (notifyOff(process.env.PERPLEXITY_WEB_MCP_NOTIFY)) return;
+    const secs = Math.round(pool.authWaitMs / 1000);
+    try {
+      const child = spawn(
+        "notify-send",
+        ["-u", "critical", "-a", "perplexity-web-mcp",
+         "Perplexity: требуется вход",
+         `Сессия слетела — открой окно браузера и войди в Perplexity (есть ~${secs} с).`],
+        { stdio: "ignore", env: process.env },
+      );
+      child.on("error", () => {}); // notify-send missing / no DISPLAY — ignore
+      child.unref();
+    } catch { /* ignore */ }
+  }
+
+  // Open the single login grace window: notify once, then poll the session in the
+  // background. On login → trust the session and clear the window. On timeout →
+  // enter a cooldown so searches are skipped (not hung) until it lapses.
+  function openLoginWindow(): void {
+    if (authPolling) return;
+    authPolling = true;
+    authWindowUntil = Date.now() + pool.authWaitMs;
+    notifyAuthRequired();
+    log(`Not authenticated — login window open for ${Math.round(pool.authWaitMs / 1000)}s; user notified.`);
+    void (async () => {
+      try {
+        while (Date.now() < authWindowUntil) {
+          await new Promise((r) => setTimeout(r, AUTH_POLL_MS));
+          if (await probeSession().catch(() => false)) {
+            authOkUntil = Date.now() + AUTH_OK_TTL_MS;
+            authWindowUntil = 0;
+            authBlockedUntil = 0;
+            log("Login detected — resuming searches.");
+            return;
+          }
+        }
+        // Loop ended. If an explicit login (handleLogin) confirmed the session
+        // meanwhile, don't arm the cooldown — let searches resume.
+        if (Date.now() < authOkUntil) { authWindowUntil = 0; return; }
+        authBlockedUntil = Date.now() + pool.authCooldownMs;
+        authWindowUntil = 0;
+        log(`Login window expired without auth — skipping searches for ${Math.round(pool.authCooldownMs / 1000)}s.`);
+      } finally {
+        authPolling = false;
+      }
+    })();
+  }
+
+  // Preflight gate for every search. Throws LOGIN_REQUIRED (fast, never hangs)
+  // whenever the session isn't usable, so no search tab is ever opened while
+  // logged out.
+  async function gateAuth(): Promise<void> {
+    const now = Date.now();
+    if (now < authOkUntil) return;
+    if (now < authWindowUntil) {
+      throw new DispatcherError("LOGIN_REQUIRED", "Perplexity login required — a login window is open and you have been notified. Retry once logged in.");
+    }
+    if (now < authBlockedUntil) {
+      throw new DispatcherError("LOGIN_REQUIRED", "Perplexity login required — the login window passed; skipping this request. Log in, then retry.");
+    }
+    if (await probeSession().catch(() => false)) {
+      authOkUntil = Date.now() + AUTH_OK_TTL_MS;
+      return;
+    }
+    openLoginWindow();
+    throw new DispatcherError("LOGIN_REQUIRED", "Perplexity login required — a login window was opened and you have been notified. Retry once logged in.");
+  }
 
   let markReady!: () => void;
   const ready = new Promise<void>((res) => { markReady = res; });
@@ -76,6 +188,9 @@ export async function runDaemon(pool: ResolvedPool): Promise<void> {
   async function handleSearch(socket: net.Socket, req: RpcRequest): Promise<void> {
     try { await ready; } catch (e) { sendError(socket, req.id, e); return; }
 
+    // Auth preflight — fail fast (don't open a search tab) while logged out.
+    try { await gateAuth(); } catch (e) { sendError(socket, req.id, e); return; }
+
     let slot: Slot;
     try { slot = await tabPool.acquire(); }
     catch (e) { sendError(socket, req.id, e); return; }
@@ -113,10 +228,17 @@ export async function runDaemon(pool: ResolvedPool): Promise<void> {
         const ctx = getContext();
         const page = ctx.pages()[0] ?? await ctx.newPage();
         if (await checkSession(page)) {
+          authOkUntil = Date.now() + AUTH_OK_TTL_MS;
+          authWindowUntil = 0;
+          authBlockedUntil = 0;
           send(socket, { type: "result", id: req.id, result: { message: "Already authenticated on Perplexity.ai." } });
           return;
         }
         await ensureAuthenticatedOnPage(page);
+        // Successful interactive login — let queued searches resume immediately.
+        authOkUntil = Date.now() + AUTH_OK_TTL_MS;
+        authWindowUntil = 0;
+        authBlockedUntil = 0;
         send(socket, { type: "result", id: req.id, result: { message: "Login successful. You are now authenticated on Perplexity.ai." } });
       } catch (e) {
         sendError(socket, req.id, e);
