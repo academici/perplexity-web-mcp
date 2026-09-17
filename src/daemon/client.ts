@@ -1,6 +1,7 @@
 import net from "net";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { existsSync } from "fs";
 import type { ResolvedPool } from "../pool.js";
 import type { SearchResult } from "../search.js";
 import { DispatcherError, type Dispatcher } from "../dispatcher.js";
@@ -13,14 +14,23 @@ import {
   type ServerMessage,
 } from "./protocol.js";
 
-// Thrown when no daemon is reachable and we couldn't start one. index.ts treats
-// this (and only this) as the signal to fall back to legacy in-process mode.
+// Thrown when no daemon is reachable and we couldn't start one. The client-side
+// fallback router may choose legacy mode only when there is no sign of daemon
+// ownership for the pool socket/profile.
 // A PROTOCOL_MISMATCH deliberately does NOT fall back — a daemon IS running, just
 // a different version, and launching a legacy browser on its profile would clash.
 export class DaemonUnavailableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DaemonUnavailableError";
+  }
+}
+
+// Daemon process exists but is not yet serving requests.
+export class DaemonStartingError extends DaemonUnavailableError {
+  constructor(message: string) {
+    super(message);
+    this.name = "DaemonStartingError";
   }
 }
 
@@ -69,7 +79,10 @@ function spawnDaemon(entry: string, daemonArgs: string[]): void {
 
 function awaitHello(conn: Conn): Promise<void> {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new DaemonUnavailableError("Timed out waiting for daemon hello")), HELLO_TIMEOUT_MS);
+    const t = setTimeout(
+      () => reject(new DaemonStartingError("Timed out waiting for daemon hello")),
+      HELLO_TIMEOUT_MS,
+    );
     conn.onMessage((m) => {
       if (m.type !== "hello") return;
       clearTimeout(t);
@@ -84,7 +97,7 @@ function awaitHello(conn: Conn): Promise<void> {
       resolve();
     });
     conn.socket.once("error", (e) => { clearTimeout(t); reject(new DaemonUnavailableError(e.message)); });
-    conn.socket.once("close", () => { clearTimeout(t); reject(new DaemonUnavailableError("Connection closed before hello")); });
+    conn.socket.once("close", () => { clearTimeout(t); reject(new DaemonStartingError("Connection closed before hello")); });
   });
 }
 
@@ -99,7 +112,14 @@ async function connectOrSpawn(pool: ResolvedPool, entry: string, daemonArgs: str
       sock = await tryConnect(pool.socketPath);
       delay = Math.min(Math.round(delay * 1.5), 500);
     }
-    if (!sock) throw new DaemonUnavailableError(`Daemon for pool "${pool.name}" did not start within ${STARTUP_TIMEOUT_MS}ms`);
+    if (!sock) {
+      if (existsSync(pool.socketPath)) {
+        throw new DaemonStartingError(
+          `Daemon for pool "${pool.name}" is starting (socket exists but no connection yet)`,
+        );
+      }
+      throw new DaemonUnavailableError(`Daemon for pool "${pool.name}" did not start within ${STARTUP_TIMEOUT_MS}ms`);
+    }
   }
   const conn = new Conn(sock);
   try {
