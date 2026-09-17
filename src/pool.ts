@@ -1,6 +1,7 @@
 import os from "os";
 import path from "path";
 import { createHash } from "crypto";
+import { existsSync } from "fs";
 import { type Config, type SaturationCfg, getPoolKnobs } from "./config.js";
 
 export interface ResolvedPool {
@@ -22,8 +23,21 @@ const ENDPOINT_DIR_NAME = "perplexity-web-mcp";
 // Linux allows ~108. Above this threshold we hash the pool name to a short file.
 const MAX_SOCKET_PATH = 100;
 
+export function defaultRuntimeDir(
+  platform = process.platform,
+  uid: number | undefined = process.getuid?.(),
+  directoryExists: (candidate: string) => boolean = existsSync,
+): string {
+  if (platform === "linux" && uid !== undefined) {
+    const candidate = `/run/user/${uid}`;
+    if (directoryExists(candidate)) return candidate;
+  }
+
+  return os.tmpdir();
+}
+
 export function runtimeDir(env: NodeJS.ProcessEnv): string {
-  return env.XDG_RUNTIME_DIR || os.tmpdir();
+  return env.XDG_RUNTIME_DIR || defaultRuntimeDir();
 }
 
 export function endpointDir(runtimeDirPath: string): string {

@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import os from "node:os";
 import path from "node:path";
 import {
+  defaultRuntimeDir,
   runtimeDir,
   sanitize,
   deriveEndpointPath,
@@ -13,6 +15,16 @@ import { mergeConfig } from "../src/config.ts";
 test("runtimeDir prefers XDG_RUNTIME_DIR, falls back to tmpdir", () => {
   assert.equal(runtimeDir({ XDG_RUNTIME_DIR: "/run/user/1000" }), "/run/user/1000");
   assert.notEqual(runtimeDir({}), undefined);
+});
+
+test("defaultRuntimeDir restores the systemd user runtime when XDG is omitted", () => {
+  const found = defaultRuntimeDir("linux", 1000, (candidate) => candidate === "/run/user/1000");
+  assert.equal(found, "/run/user/1000");
+});
+
+test("defaultRuntimeDir uses tmpdir when the systemd user runtime is unavailable", () => {
+  const found = defaultRuntimeDir("linux", 1000, () => false);
+  assert.equal(found, os.tmpdir());
 });
 
 test("sanitize strips unsafe characters", () => {

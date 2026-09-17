@@ -42,42 +42,30 @@ async function buildDispatcher(pool: ResolvedPool): Promise<Dispatcher> {
     return createLegacyDispatcher({ searchTimeoutMs: pool.searchTimeoutMs, deepTimeoutMs: pool.deepTimeoutMs });
   }
 
-  // daemon mode with automatic fallback to legacy if no daemon can be reached/started
-  const { createDaemonDispatcher, DaemonUnavailableError } = await import("./daemon/client.js");
+  // daemon mode with automatic fallback to legacy when no daemon ownership
+  // signal exists for this pool (no socket and no reachable peer).
+  const { createDaemonDispatcher } = await import("./daemon/client.js");
+  const { createFallbackDispatcher } = await import("./daemon/fallback.js");
   // The daemon is a separate executable (dist/daemon/main.js), spawned detached.
   const daemonEntry = path.join(__dirname, "daemon", "main.js");
   // Use the --key=value form: parseFlags only understands that form.
   const daemonArgs = [`--pool=${pool.name}`, ...(flags.config ? [`--config=${flags.config}`] : [])];
   const daemon = createDaemonDispatcher(pool, daemonEntry, daemonArgs);
 
-  let legacy: Dispatcher | null = null;
-  let usingLegacy = false;
-  async function getLegacy(): Promise<Dispatcher> {
-    if (!legacy) {
+  return createFallbackDispatcher({
+    poolName: pool.name,
+    socketPath: pool.socketPath,
+    daemon,
+    createLegacy: async () => {
       const { createLegacyDispatcher } = await import("./legacy.js");
-      legacy = createLegacyDispatcher({ searchTimeoutMs: pool.searchTimeoutMs, deepTimeoutMs: pool.deepTimeoutMs });
-    }
-    return legacy;
-  }
-  async function route<T>(fn: (d: Dispatcher) => Promise<T>): Promise<T> {
-    if (usingLegacy) return fn(await getLegacy());
-    try {
-      return await fn(daemon);
-    } catch (e) {
-      if (e instanceof DaemonUnavailableError) {
-        console.error(`[perplexity-web-mcp] Daemon unavailable (${e.message}) — falling back to legacy in-process mode.`);
-        usingLegacy = true;
-        return fn(await getLegacy());
-      }
-      throw e;
-    }
-  }
-  return {
-    search: (q) => route((d) => d.search(q)),
-    searchAdvanced: (q, s) => route((d) => d.searchAdvanced(q, s)),
-    searchDeep: (q) => route((d) => d.searchDeep(q)),
-    login: () => route((d) => d.login()),
-  };
+      return createLegacyDispatcher({
+        searchTimeoutMs: pool.searchTimeoutMs,
+        deepTimeoutMs: pool.deepTimeoutMs,
+      });
+    },
+    // Always retry daemon on the next request after an unavailable fallback.
+    retryDaemonAfterMs: 0,
+  });
 }
 
 // --- MCP server wiring (client process). ---

@@ -35,6 +35,19 @@ export interface RunSearchOpts {
   deepResearch?: boolean;
 }
 
+export interface AnswerDomSnapshot {
+  tabpanels: number[];
+  prose: number[];
+}
+
+export type AnswerRootKind = "tabpanel" | "prose";
+
+export function selectAnswerRootKind(snapshot: AnswerDomSnapshot): AnswerRootKind | null {
+  if (snapshot.tabpanels.some((length) => length > 0)) return "tabpanel";
+  if (snapshot.prose.some((length) => length > 0)) return "prose";
+  return null;
+}
+
 // Run a full Perplexity search on a caller-supplied page. The caller owns the
 // page lifecycle (the daemon's TabPool, or the legacy wrapper above) — this
 // function never creates or closes the tab, so parallel searches in sibling
@@ -348,9 +361,20 @@ async function dismissDialogs(page: Page): Promise<void> {
 }
 
 async function extractAnswer(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const panel = document.querySelector('[role="tabpanel"]');
-    if (!panel) return "";
+  const snapshot = await page.evaluate(() => ({
+    tabpanels: Array.from(document.querySelectorAll('[role="tabpanel"]'))
+      .map((element) => (element.textContent ?? "").trim().length),
+    prose: Array.from(document.querySelectorAll("main .prose"))
+      .map((element) => (element.textContent ?? "").trim().length),
+  }));
+  const rootKind = selectAnswerRootKind(snapshot);
+  if (!rootKind) return "";
+
+  return page.evaluate((kind) => {
+    const selector = kind === "tabpanel" ? '[role="tabpanel"]' : "main .prose";
+    const roots = Array.from(document.querySelectorAll(selector))
+      .filter((element) => (element.textContent ?? "").trim().length > 0)
+      .filter((element) => !element.parentElement?.closest(selector));
 
     function getCleanText(el: Element): string {
       let text = "";
@@ -373,7 +397,7 @@ async function extractAnswer(page: Page): Promise<string> {
     const parts: string[] = [];
     const seen = new Set<string>();
 
-    panel.querySelectorAll("h2, h3, p, li, pre code").forEach((el) => {
+    roots.forEach((root) => root.querySelectorAll("h2, h3, p, li, pre code").forEach((el) => {
       if (el.tagName === "P" && el.closest("li")) return;
       if (el.tagName === "LI" && el.querySelector("li")) return;
 
@@ -391,10 +415,10 @@ async function extractAnswer(page: Page): Promise<string> {
       } else {
         parts.push(text);
       }
-    });
+    }));
 
     return parts.join("\n").trim();
-  });
+  }, rootKind);
 }
 
 async function extractSources(page: Page): Promise<Source[]> {
